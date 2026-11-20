@@ -56,17 +56,22 @@ APP="src-tauri/target/release/bundle/macos/yutas.app"
 codesign --verify --deep --strict "$APP"
 codesign -d -vv "$APP" 2>&1 | grep -E '^(Identifier|Authority=Developer ID|TeamIdentifier|Runtime)'
 
-# The disk image: the app next to a shortcut to /Applications. Built with
-# hdiutil alone (Tauri's own DMG step drives Finder, which needs a permission
-# prompt answered and times out otherwise).
+# The disk image: a window with the app on the left and the Applications
+# folder on the right, to install by dragging. The window layout is a file
+# Finder wrote once (scripts/dmg/DS_Store, made by make-dmg-layout.sh) and
+# is only copied in here, so the build never has to drive Finder. (Tauri's
+# own DMG step does, and times out unless a permission prompt is answered.)
+# The volume name and the two item names must match make-dmg-layout.sh.
 VERSION=$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' src-tauri/tauri.conf.json | head -1)
 DMG="src-tauri/target/release/bundle/yutas_${VERSION}_$(uname -m).dmg"
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
+chmod 755 "$STAGE"
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
+cp scripts/dmg/DS_Store "$STAGE/.DS_Store"
 rm -f "$DMG"
-hdiutil create -quiet -volname yutas -srcfolder "$STAGE" -format UDZO "$DMG"
+hdiutil create -quiet -volname yutas -srcfolder "$STAGE" -fs HFS+ -format UDZO "$DMG"
 codesign --force --sign "$APPLE_SIGNING_IDENTITY" "$DMG"
 
 if [ -n "${APPLE_ID:-}" ]; then

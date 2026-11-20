@@ -149,6 +149,8 @@ npm run build
 - `src-tauri/target/release/bundle/macos/yutas.app`
 - `src-tauri/target/release/bundle/yutas_<バージョン>_arm64.dmg`（配るのはこちら）
 
+DMG を開くと、yutas と「アプリケーション」フォルダが並んだウィンドウが出ます。yutas をフォルダへドラッグすればインストールできます。ウィンドウの配置は `scripts/dmg/DS_Store` に保存してあり、ビルドのたびにコピーします。配置を変えたいときだけ `sh scripts/make-dmg-layout.sh` を実行して作り直してください（Finder を操作するので、macOS が許可を求めることがあります）。
+
 #### 署名と公証
 
 `npm run build`（`scripts/build-mac.sh`）は、Developer ID で署名し、Apple の公証を受けます。資格情報は roku-log と同じものを、同じ変数名で使います。シェルの環境変数か、このフォルダの `.env`（コミットしません）に書きます。
@@ -211,6 +213,7 @@ Claude の呼び出しは、社内の Claude apps gateway へのデバイスコ�
 | `src-tauri/src/secrets.rs` | サインイン情報の保存（キーチェーン） |
 | `src-tauri/src/autostart.rs` | ログイン時の自動起動 |
 | `scripts/build-mac.sh` | ビルド、署名、公証、DMG の作成 |
+| `scripts/make-dmg-layout.sh`, `scripts/dmg/DS_Store` | DMG を開いたときのウィンドウの配置 |
 | `src-tauri/src/pill.rs`, `ui/pill.html` | 画面下の状態表示 |
 | `ui/settings.html` | 設定画面 |
 
