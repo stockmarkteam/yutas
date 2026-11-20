@@ -19,9 +19,10 @@
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
   body {
-    display: grid; grid-template-rows: auto auto 1fr auto auto;
+    /* A column, not grid rows: the permission notice comes and goes. */
+    display: flex; flex-direction: column;
     background: var(--bg); color: var(--text);
-    font: 14px/1.55 "Yu Gothic UI", "Meiryo", system-ui, sans-serif;
+    font: 14px/1.55 "Hiragino Sans", system-ui, sans-serif;
   }
   header { display: flex; align-items: center; gap: 12px; padding: 14px 20px 6px; }
   header h1 { font-size: 17px; margin: 0; font-weight: 700; }
@@ -36,7 +37,7 @@
   }
   nav button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
 
-  main { overflow-y: auto; padding: 18px 20px; }
+  main { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 18px 20px; }
   section[hidden] { display: none; }
   h2 { font-size: 14px; margin: 0 0 4px; }
   .help { color: var(--muted); font-size: 12.5px; margin: 0 0 10px; }
@@ -98,7 +99,32 @@
     width: 100%; font: inherit; color: var(--text); background: var(--field);
     border: 1px solid var(--line); border-radius: 7px; padding: 7px 9px;
   }
-  code { font-family: Consolas, monospace; font-size: 12.5px; background: var(--chip); padding: 1px 5px; border-radius: 4px; word-break: break-all; }
+  code { font-family: Menlo, monospace; font-size: 12.5px; background: var(--chip); padding: 1px 5px; border-radius: 4px; word-break: break-all; }
+
+  /* The permission notice: text on the left, its one action on the right;
+     the action drops below the text when the window is narrow. */
+  #permission {
+    flex: none; margin: 12px 20px 0; padding: 12px 16px 12px 14px;
+    display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 20px; row-gap: 10px; align-items: center;
+    background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--danger); border-radius: 10px;
+  }
+  #permission[hidden] { display: none; }
+  #permission h2 { margin: 0 0 2px; }
+  #permission p { margin: 0; font-size: 12.5px; color: var(--muted); }
+  #permission .again { margin-top: 6px; }
+  #permission .btn { white-space: nowrap; }
+  #permission .link {
+    font: inherit; color: var(--accent); background: none; border: 0; padding: 0; cursor: pointer;
+    text-decoration: underline; text-underline-offset: 2px;
+  }
+  #permissionNote:empty { display: none; }
+  #permissionNote { grid-column: 1 / -1; color: var(--danger); }
+  @media (max-width: 620px) {
+    #permission { grid-template-columns: minmax(0, 1fr); }
+    #permission .btn { justify-self: start; }
+  }
+  #gwHelp { margin-top: 8px; }
+  #gwCode { font-size: 18px; letter-spacing: 0.08em; user-select: all; }
 
   #tester { border-top: 1px solid var(--line); background: var(--panel); padding: 10px 20px; }
   #tester .line { display: grid; grid-template-columns: 1fr 170px auto; gap: 8px; align-items: center; }
@@ -124,6 +150,16 @@
   <button role="tab" data-tab="dict" aria-selected="false">辞書</button>
   <button role="tab" data-tab="general" aria-selected="false">一般</button>
 </nav>
+
+<div id="permission" role="status" hidden>
+  <div>
+    <h2>アクセシビリティの許可が必要です</h2>
+    <p>キー入力の検知と、清書結果の貼り付けに使います。システム設定の一覧で yutas をオンにすると、すぐ動き始めます。</p>
+    <p class="again">一覧でオンなのに動かないときは、ビルドし直す前の許可が残っています。<button class="link" id="resetAccessibility">許可をやり直す</button></p>
+  </div>
+  <button class="btn primary" id="openAccessibility">システム設定を開く</button>
+  <p id="permissionNote"></p>
+</div>
 
 <main>
   <section id="tab-tone">
@@ -169,35 +205,19 @@
   <section id="tab-general" hidden>
     <div class="block">
       <h2>清書に使うAI</h2>
-      <p class="help">Claude は速くて高精度ですが、入力した文章を Anthropic に送ります。ローカルLLM はこの PC の中だけで処理します。</p>
+      <p class="help">Claude は速くて高精度です。入力した文章は、社内の Claude apps gateway を通して処理されます(Anthropic の API には直接つなぎません)。ローカルLLM はこの Mac の中だけで処理します。</p>
       <div class="seg" role="radiogroup" aria-label="清書に使うAI">
-        <label><input type="radio" name="provider" value="anthropic"> Claude(クラウド)</label>
+        <label><input type="radio" name="provider" value="gateway"> Claude(社内ゲートウェイ)</label>
         <label><input type="radio" name="provider" value="local"> ローカルLLM</label>
       </div>
 
-      <div id="panel-anthropic">
-        <label for="apiKey">APIキー</label>
+      <div id="panel-gateway">
         <div class="inline">
-          <input type="password" id="apiKey" autocomplete="off" spellcheck="false" placeholder="sk-ant-…">
-          <button class="btn" id="keySave">キーを保存</button>
-          <button class="btn" id="keyDelete">削除</button>
+          <button class="btn" id="gwSignIn">サインイン</button>
+          <button class="btn" id="gwSignOut">サインアウト</button>
         </div>
-        <p class="help" id="keyHelp"></p>
-        <div class="row2">
-          <div>
-            <label for="model">モデル</label>
-            <input type="text" id="model" list="models" spellcheck="false">
-            <datalist id="models">
-              <option value="claude-haiku-5-5">速い(既定)</option>
-              <option value="claude-sonnet-5-5">高品質・やや遅い</option>
-              <option value="claude-opus-5-5">最高品質・遅い</option>
-            </datalist>
-          </div>
-          <div>
-            <label for="workspace">ワークスペースID(必要な場合のみ)</label>
-            <input type="text" id="workspace" spellcheck="false" placeholder="キーがワークスペースに紐づいていないとき">
-          </div>
-        </div>
+        <p class="help" id="gwHelp"></p>
+        <p class="help">接続先は <code>ax.stockmark.co.jp</code>、モデルは Claude Haiku 5.5(国内リージョン)に固定です。</p>
       </div>
 
       <div id="panel-local" hidden>
@@ -222,15 +242,14 @@
             <option value="shift">Shift(左右どちらでも)</option>
             <option value="lshift">左Shift</option>
             <option value="rshift">右Shift</option>
-            <option value="ctrl">Ctrl(左右どちらでも)</option>
-            <option value="lctrl">左Ctrl</option>
-            <option value="rctrl">右Ctrl</option>
-            <option value="convert">変換キー(JIS配列)</option>
+            <option value="ctrl">Control(左右どちらでも)</option>
+            <option value="lctrl">左Control</option>
+            <option value="rctrl">右Control</option>
           </select>
         </div>
         <div>
-          <label>スタートアップ</label>
-          <label class="check"><input type="checkbox" id="autostart"> PC の起動時に yutas を起動する</label>
+          <label>ログイン項目</label>
+          <label class="check"><input type="checkbox" id="autostart"> ログイン時に yutas を起動する</label>
           <p class="help" id="autostartHelp"></p>
         </div>
       </div>
@@ -299,7 +318,7 @@
         const wrap = document.createElement('div'); wrap.className = 'rule';
         const head = document.createElement('div'); head.className = 'rule-head';
         const app = document.createElement('input');
-        app.type = 'text'; app.value = rule.app; app.placeholder = 'アプリの実行ファイル名(例: slack.exe)';
+        app.type = 'text'; app.value = rule.app; app.placeholder = 'アプリ名(例: slack)';
         app.setAttribute('list', 'apps'); app.setAttribute('aria-label', 'アプリ'); app.spellcheck = false;
         app.addEventListener('input', () => { rule.app = app.value; markDirty(); renderTestApps(); });
         const del = document.createElement('button');
@@ -330,6 +349,15 @@
   }
 
   // ---- dictionary ----
+  // Enter that only confirms an IME conversion must not act as "next field".
+  // WebKit reports that Enter with isComposing already false, right after
+  // compositionend, so remember when the last composition ended.
+  let compositionEndedAt = 0;
+  document.addEventListener('compositionend', () => { compositionEndedAt = performance.now(); }, true);
+  function isPlainEnter(e) {
+    return e.key === 'Enter' && !e.isComposing && e.keyCode !== 229 && performance.now() - compositionEndedAt > 100;
+  }
+
   function renderDict(focusLast = false) {
     const filter = $('dictFilter').value.trim().toLowerCase();
     const rows = [];
@@ -340,9 +368,20 @@
         const input = document.createElement('input');
         input.type = 'text'; input.value = entry[field]; input.setAttribute('aria-label', label);
         input.addEventListener('input', () => { entry[field] = input.value; markDirty(); });
+        // Enter moves on the way one fills a row in: reading -> word ->
+        // the next row's reading (a new row after the last one).
         input.addEventListener('keydown', (e) => {
-          if (e.key === 'Enter' && !e.isComposing && i === settings.dictionary.length - 1) addWord();
+          if (!isPlainEnter(e)) return;
+          e.preventDefault();
+          if (field === 'reading') {
+            tr.querySelector('input[data-field="word"]').focus();
+          } else if (tr.nextElementSibling) {
+            tr.nextElementSibling.querySelector('input').focus();
+          } else if (i === settings.dictionary.length - 1) {
+            addWord();
+          }
         });
+        input.dataset.field = field;
         const td = document.createElement('td'); td.append(input);
         return td;
       };
@@ -374,18 +413,16 @@
     settings.extraInstructions = $('extra').value;
     settings.trigger = $('trigger').value;
     settings.provider = currentProvider();
-    settings.model = $('model').value;
-    settings.workspaceId = $('workspace').value;
     settings.localUrl = $('localUrl').value;
     settings.localModel = $('localModel').value;
     return settings;
   }
 
-  // ---- provider, API key, autostart ----
+  // ---- provider, gateway sign-in, autostart ----
   let status = null;
 
   function currentProvider() {
-    return document.querySelector('input[name="provider"]:checked')?.value || 'anthropic';
+    return document.querySelector('input[name="provider"]:checked')?.value || 'gateway';
   }
 
   function note(id, text, kind = '') {
@@ -393,51 +430,82 @@
     $(id).textContent = text;
   }
 
-  const KEY_NOTES = {
-    stored: 'APIキーは Windows の資格情報マネージャーに保存されています。設定ファイルには書きません。',
-    env: 'いまは環境変数 ANTHROPIC_API_KEY のキーを使っています。ここで保存すると、保存したキーが優先されます。',
-    none: 'APIキーが未設定です。入力して「キーを保存」を押してください。Windows の資格情報マネージャーに保存されます。',
-  };
+  function sessionNote() {
+    if (status.session === 'signed-in') {
+      return (status.email ? status.email + ' で' : '') + 'サインイン済みです。サインイン情報はキーチェーンに保存され、設定ファイルには書きません。';
+    }
+    if (status.session === 'expired') return 'サインインの有効期限が切れました。もう一度サインインしてください。';
+    return '「サインイン」を押すと、ブラウザが開きます。会社のアカウントでサインインしてください。';
+  }
 
   function renderStatus() {
     const local = currentProvider() === 'local';
-    $('panel-anthropic').hidden = local;
+    $('panel-gateway').hidden = local;
     $('panel-local').hidden = !local;
     if (!status) return;
+    const signedIn = status.session === 'signed-in';
     const badge = $('keyBadge');
-    const keyed = status.keySource !== 'none';
     badge.textContent = status.mock ? 'モックで動作中'
       : local ? 'ローカルLLM'
-      : status.keySource === 'stored' ? 'Claude・APIキー保存済み'
-      : status.keySource === 'env' ? 'Claude・APIキーは環境変数'
-      : 'Claude・APIキー未設定';
-    badge.className = 'badge ' + (status.mock || local || keyed ? 'ok' : 'bad');
-    $('keyDelete').disabled = status.keySource !== 'stored';
+      : signedIn ? 'Claude・サインイン済み'
+      : status.session === 'expired' ? 'Claude・再サインインが必要'
+      : 'Claude・未サインイン';
+    badge.className = 'badge ' + (status.mock || local || signedIn ? 'ok' : 'bad');
+    $('gwSignOut').disabled = status.session === 'none';
     $('autostart').checked = status.autostart;
     $('configPath').textContent = status.configPath;
+    $('permission').hidden = status.hookActive;
   }
 
-  async function refreshStatus(keyNote = true) {
+  let signingIn = false;
+
+  async function refreshStatus(sessionHelp = true) {
     status = await invoke('get_status');
     renderStatus();
-    if (keyNote) note('keyHelp', KEY_NOTES[status.keySource]);
+    if (sessionHelp && !signingIn) note('gwHelp', sessionNote(), status.session === 'expired' ? 'error' : '');
   }
 
-  async function saveKey() {
+  async function signIn() {
+    if (signingIn) {
+      await invoke('gateway_login_cancel');
+      return;
+    }
+    signingIn = true;
+    // Nothing to cancel until the gateway has answered.
+    $('gwSignIn').disabled = true;
+    $('gwSignIn').textContent = '接続中…';
+    note('gwHelp', 'ゲートウェイに接続しています…');
     try {
-      await invoke('set_api_key', { key: $('apiKey').value });
-      $('apiKey').value = '';
+      const login = await invoke('gateway_login_start');
+      $('gwSignIn').disabled = false;
+      $('gwSignIn').textContent = 'やめる';
+      const code = document.createElement('code'); code.id = 'gwCode'; code.textContent = login.userCode;
+      const where = document.createElement('code'); where.textContent = login.verificationUri;
+      $('gwHelp').className = 'help';
+      $('gwHelp').replaceChildren(
+        'ブラウザでサインインしてください。表示されるコードが次と同じことを確かめてください: ', code,
+        document.createElement('br'), 'ブラウザが開かないときは、この URL を開いてください: ', where);
+      const email = await invoke('gateway_login_wait', { login });
+      signingIn = false;
       await refreshStatus(false);
-      note('keyHelp', 'APIキーを保存しました。次の清書から使われます。', 'ok');
-    } catch (e) { note('keyHelp', String(e), 'error'); }
+      note('gwHelp', (email ? email + ' で' : '') + 'サインインしました。次の清書から使われます。', 'ok');
+    } catch (e) {
+      signingIn = false;
+      await refreshStatus(false);
+      note('gwHelp', String(e), 'error');
+    } finally {
+      signingIn = false;
+      $('gwSignIn').disabled = false;
+      $('gwSignIn').textContent = 'サインイン';
+    }
   }
 
-  async function deleteKey() {
+  async function signOut() {
     try {
-      await invoke('delete_api_key');
+      await invoke('gateway_sign_out');
       await refreshStatus(false);
-      note('keyHelp', '保存していたAPIキーを削除しました。' + (status.keySource === 'env' ? '環境変数のキーを使います。' : ''), 'ok');
-    } catch (e) { note('keyHelp', String(e), 'error'); }
+      note('gwHelp', 'サインアウトしました。', 'ok');
+    } catch (e) { note('gwHelp', String(e), 'error'); }
   }
 
   async function toggleAutostart() {
@@ -474,14 +542,15 @@
     $('tone').value = settings.tone;
     $('extra').value = settings.extraInstructions;
     $('trigger').value = settings.trigger;
-    $('model').value = settings.model;
-    $('workspace').value = settings.workspaceId;
     $('localUrl').value = settings.localUrl;
     $('localModel').value = settings.localModel;
-    document.querySelector(`input[name="provider"][value="${settings.provider === 'local' ? 'local' : 'anthropic'}"]`).checked = true;
+    document.querySelector(`input[name="provider"][value="${settings.provider === 'local' ? 'local' : 'gateway'}"]`).checked = true;
     renderRules();
     renderDict();
     await refreshStatus();
+
+    // The permission can be granted at any time; notice when it is.
+    setInterval(() => { if (!status.hookActive) refreshStatus(false); }, 2000);
 
     const apps = await invoke('list_apps');
     $('apps').replaceChildren(...apps.map((a) => new Option(a, a)));
@@ -496,6 +565,7 @@
       $('saveState').textContent = '保存しました。次の清書から反映されます';
       settings = await invoke('get_settings');
       renderRules(); renderDict();
+      await refreshStatus();
     } catch (e) {
       $('saveState').className = 'error';
       $('saveState').textContent = String(e);
@@ -527,12 +597,19 @@
   }));
   document.querySelector(`nav button[data-tab="${location.hash.slice(1)}"]`)?.click();
   presetChips(document.querySelector('[data-presets-for="tone"]'), (text) => { $('tone').value = text; markDirty(); });
-  for (const id of ['tone', 'extra', 'model', 'workspace', 'localUrl', 'localModel']) $(id).addEventListener('input', markDirty);
+  for (const id of ['tone', 'extra', 'localUrl', 'localModel']) $(id).addEventListener('input', markDirty);
   $('trigger').addEventListener('change', markDirty);
   document.querySelectorAll('input[name="provider"]').forEach((radio) => radio.addEventListener('change', () => { markDirty(); renderStatus(); }));
-  $('keySave').addEventListener('click', saveKey);
-  $('apiKey').addEventListener('keydown', (e) => { if (e.key === 'Enter') saveKey(); });
-  $('keyDelete').addEventListener('click', deleteKey);
+  $('gwSignIn').addEventListener('click', signIn);
+  $('gwSignOut').addEventListener('click', signOut);
+  async function accessibility(reset) {
+    try {
+      await invoke('request_accessibility', { reset });
+      $('permissionNote').textContent = '';
+    } catch (e) { $('permissionNote').textContent = String(e); }
+  }
+  $('openAccessibility').addEventListener('click', () => accessibility(false));
+  $('resetAccessibility').addEventListener('click', () => accessibility(true));
   $('autostart').addEventListener('change', toggleAutostart);
   $('fetchModels').addEventListener('click', fetchModels);
   $('addRule').addEventListener('click', () => {
@@ -544,7 +621,7 @@
   $('dictFilter').addEventListener('input', () => renderDict());
   $('save').addEventListener('click', save);
   $('testRun').addEventListener('click', runTest);
-  $('testInput').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) runTest(); });
+  $('testInput').addEventListener('keydown', (e) => { if (isPlainEnter(e)) runTest(); });
   window.addEventListener('keydown', (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); if (dirty) save(); }
   });

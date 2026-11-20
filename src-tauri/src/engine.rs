@@ -8,11 +8,11 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use tauri::AppHandle;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_RETURN, VK_RIGHT};
 
 use crate::hook::{self, Job, Last};
 use crate::llm::Mode;
 use crate::settings::Settings;
+use crate::vk::RIGHT as VK_RIGHT;
 use crate::{keys, llm, log, pill, romaji};
 
 /// Selections longer than this are refused rather than sent off by accident.
@@ -21,13 +21,12 @@ const MAX_SELECTION_CHARS: usize = 4000;
 pub fn handle(app: &AppHandle, job: Job) {
     match job {
         Job::Trigger => trigger(app),
-        Job::FlushTap => hook::release_single_tap(),
     }
     hook::finish_operation();
 }
 
 fn trigger(app: &AppHandle) {
-    // A modifier trigger fires from inside the hook, on the release that
+    // The trigger fires from inside the event tap, on the release that
     // completes the double tap. Let that release land before sending keys,
     // or it would cut our own Shift+Left selection short.
     sleep(Duration::from_millis(40));
@@ -61,7 +60,7 @@ fn trigger(app: &AppHandle) {
     pill::show(app, "working", "清書中…", "");
 
     // Commit the kana as-is, then select it again and read it back.
-    keys::tap(VK_RETURN);
+    keys::commit_composition();
     sleep(Duration::from_millis(70));
     keys::select_left(expected.len());
     sleep(Duration::from_millis(50));
@@ -88,11 +87,6 @@ fn trigger(app: &AppHandle) {
 
 /// Nothing is being composed: polish whatever the user has selected.
 fn polish_selection(app: &AppHandle) {
-    if keys::foreground_is_terminal() {
-        // Ctrl+C would interrupt the running program here.
-        pill::flash(app, "info", "ターミナルでは選択の清書は未対応です", "", 1800);
-        return;
-    }
     let started = Instant::now();
     let saved_clipboard = keys::clipboard_text();
     let selected = keys::copy_selection().map(|t| t.replace('\r', ""));
@@ -117,7 +111,7 @@ fn polish_selection(app: &AppHandle) {
 /// `source` is selected in the document. Polish it and paste over it.
 fn polish_and_replace(app: &AppHandle, mode: Mode, source: String, saved_clipboard: Option<String>, started: Instant) {
     let settings = Settings::load();
-    let (tone, rule_app) = settings.tone_for(keys::foreground_exe().as_deref());
+    let (tone, rule_app) = settings.tone_for(keys::foreground_app().as_deref());
     // Tell the user when an app-specific tone is in effect.
     let hint = rule_app.as_deref().map(|app| format!("{app} の口調")).unwrap_or_default();
     if !hint.is_empty() {

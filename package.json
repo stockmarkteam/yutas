@@ -4,7 +4,7 @@
   "version": "0.0.1",
   "scripts": {
     "tauri": "tauri",
-    "build": "tauri build --no-bundle"
+    "build": "sh scripts/build-mac.sh"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"

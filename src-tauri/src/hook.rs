@@ -1,53 +1,60 @@
-//! Low-level keyboard/mouse hooks: double-tap detection on the trigger key,
+//! What the event tap (keys.rs) feeds: double-tap detection on the trigger key,
 //! composition tracking, and holding back type-ahead while an operation runs.
 
-use std::ptr::null_mut;
 use std::sync::mpsc::Sender;
 use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock, RwLock};
-use std::thread;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
-use windows_sys::Win32::UI::WindowsAndMessaging::*;
-
-use crate::keys::{self, QKey, MAGIC, MAGIC_REPLAY};
+use crate::keys::{self, QKey};
 use crate::romaji::Composer;
+use crate::vk;
+
+/// Where a key event came from.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Origin {
+    /// The user's keyboard.
+    User,
+    /// Injected by us as part of an operation: ignored.
+    Own,
+    /// Type-ahead we held back and are now replaying: tracked, never queued again.
+    Replay,
+}
+
+/// One key press or release, as the event tap saw it.
+pub struct KeyEvent {
+    /// See vk.rs.
+    pub vk: u16,
+    pub up: bool,
+    pub origin: Origin,
+    pub shift: bool,
+    /// Control, Option or Command is held: this is a shortcut, not text.
+    pub chord: bool,
+    /// What to send to deliver this key later.
+    pub raw: QKey,
+}
 
 const DOUBLE_TAP: Duration = Duration::from_millis(350);
 
-/// What the user double-taps.
+/// What the user double-taps: a modifier. It is never held back: a tap is a
+/// press and release with no other key in between.
 #[derive(Clone, Copy)]
-pub enum Trigger {
-    /// A modifier (works on any keyboard). It is never held back: a tap is a
-    /// press and release with no other key in between.
-    Modifier { name: &'static str, vks: &'static [u16] },
-    /// A dedicated key such as 変換 (JIS keyboards). It is swallowed, and a
-    /// single tap is passed on after the double-tap window.
-    Key { name: &'static str, vk: u16 },
+pub struct Trigger {
+    name: &'static str,
+    vks: &'static [u16],
 }
 
 impl Trigger {
-    pub fn name(&self) -> &'static str {
-        match self {
-            Trigger::Modifier { name, .. } | Trigger::Key { name, .. } => name,
-        }
-    }
-}
-
-impl Trigger {
-    /// shift (default) | lshift | rshift | ctrl | lctrl | rctrl | convert
+    /// shift (default) | lshift | rshift | ctrl | lctrl | rctrl
     fn from_setting(choice: &str) -> Trigger {
-        match choice.trim().to_lowercase().as_str() {
-            "convert" => Trigger::Key { name: "変換", vk: VK_CONVERT },
-            "lshift" => Trigger::Modifier { name: "左Shift", vks: &[VK_LSHIFT] },
-            "rshift" => Trigger::Modifier { name: "右Shift", vks: &[VK_RSHIFT] },
-            "ctrl" => Trigger::Modifier { name: "Ctrl", vks: &[VK_LCONTROL, VK_RCONTROL, VK_CONTROL] },
-            "lctrl" => Trigger::Modifier { name: "左Ctrl", vks: &[VK_LCONTROL] },
-            "rctrl" => Trigger::Modifier { name: "右Ctrl", vks: &[VK_RCONTROL] },
-            _ => Trigger::Modifier { name: "Shift", vks: &[VK_LSHIFT, VK_RSHIFT, VK_SHIFT] },
-        }
+        let (name, vks): (&'static str, &'static [u16]) = match choice.trim().to_lowercase().as_str() {
+            "lshift" => ("左Shift", &[vk::LSHIFT]),
+            "rshift" => ("右Shift", &[vk::RSHIFT]),
+            "ctrl" => ("Control", &[vk::LCONTROL, vk::RCONTROL]),
+            "lctrl" => ("左Control", &[vk::LCONTROL]),
+            "rctrl" => ("右Control", &[vk::RCONTROL]),
+            _ => ("Shift", &[vk::LSHIFT, vk::RSHIFT]),
+        };
+        Trigger { name, vks }
     }
 }
 
@@ -62,18 +69,14 @@ pub fn set_trigger(choice: &str) {
     let new = Trigger::from_setting(choice);
     *TRIGGER.write().unwrap_or_else(|e| e.into_inner()) = new;
     let mut st = state();
-    st.tap_pending = false;
     st.tap_time = None;
     st.trigger_down = false;
-    crate::log(&format!("trigger: {} x2", new.name()));
+    crate::log(&format!("trigger: {} x2", new.name));
 }
 
 pub enum Job {
     /// The trigger was double-tapped.
     Trigger,
-    /// A single tap of a swallowed trigger key was held back and another key
-    /// followed: let it through.
-    FlushTap,
 }
 
 #[derive(Clone)]
@@ -99,11 +102,8 @@ pub struct State {
 
     /// Time of the first tap, while waiting for the second.
     tap_time: Option<Instant>,
-    /// Trigger::Key only: a single tap is being held back.
-    tap_pending: bool,
-    tap_gen: u64,
     trigger_down: bool,
-    /// Trigger::Modifier only: no other key since the modifier went down.
+    /// No other key since the trigger went down.
     trigger_clean: bool,
 
     /// The last result is still right before the caret, untouched.
@@ -144,24 +144,7 @@ fn send_job(job: Job) {
 
 pub fn start(jobs: Sender<Job>) {
     let _ = JOBS.set(jobs);
-    thread::spawn(|| unsafe {
-        let module = GetModuleHandleW(null_mut());
-        let kb = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), module, 0);
-        let mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), module, 0);
-        crate::log(&format!("hooks installed: keyboard={} mouse={}", !kb.is_null(), !mouse.is_null()));
-        let mut msg: MSG = std::mem::zeroed();
-        while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {}
-    });
-}
-
-/// Let a held-back single tap through to the IME (called off the hook thread).
-pub fn release_single_tap() {
-    if let Trigger::Key { vk, .. } = trigger() {
-        if vk == VK_CONVERT {
-            state().on_convert_key();
-        }
-        keys::tap(vk);
-    }
+    keys::install_hooks();
 }
 
 /// Deliver queued type-ahead, then leave the busy state.
@@ -180,77 +163,43 @@ pub fn finish_operation() {
     }
 }
 
-unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code == HC_ACTION as i32 {
-        let k = &*(lparam as *const KBDLLHOOKSTRUCT);
-        if handle_key(k, wparam as u32) {
-            return 1;
-        }
-    }
-    CallNextHookEx(null_mut(), code, wparam, lparam)
-}
-
-unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code == HC_ACTION as i32 {
-        let msg = wparam as u32;
-        if matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN) {
-            let mut st = state();
-            st.reset_composition();
-            st.undo_armed = false;
-            st.tap_time = None;
-            if st.busy {
-                st.cancel = true;
-            }
-        }
-    }
-    CallNextHookEx(null_mut(), code, wparam, lparam)
-}
-
-fn queued(k: &KBDLLHOOKSTRUCT, up: bool) -> QKey {
-    QKey {
-        vk: k.vkCode as u16,
-        scan: k.scanCode as u16,
-        ext: k.flags & LLKHF_EXTENDED != 0,
-        up,
+/// A mouse button went down: the caret may have moved anywhere.
+pub fn on_mouse_down() {
+    let mut st = state();
+    st.reset_composition();
+    st.undo_armed = false;
+    st.tap_time = None;
+    if st.busy {
+        st.cancel = true;
     }
 }
 
 /// Returns true when the key must not reach the application.
-fn handle_key(k: &KBDLLHOOKSTRUCT, msg: u32) -> bool {
-    if k.dwExtraInfo == MAGIC {
+pub fn handle_key(ev: KeyEvent) -> bool {
+    if ev.origin == Origin::Own {
         return false;
     }
-    let replay = k.dwExtraInfo == MAGIC_REPLAY;
-    let up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
-    let vk = k.vkCode as u16;
+    let replay = ev.origin == Origin::Replay;
+    let up = ev.up;
+    let vk = ev.vk;
     let current = trigger();
     let mut st = state();
 
-    if !replay {
-        match current {
-            Trigger::Modifier { vks, .. } => {
-                if modifier_trigger(&mut st, vks.contains(&vk), up) {
-                    st.busy = true;
-                    st.cancel = false;
-                    drop(st);
-                    send_job(Job::Trigger);
-                    return false; // the release itself still reaches the app
-                }
-            }
-            Trigger::Key { vk: trigger, .. } if vk == trigger => {
-                return key_trigger(st, up);
-            }
-            Trigger::Key { .. } => {}
-        }
+    if !replay && modifier_trigger(&mut st, current.vks.contains(&vk), up) {
+        st.busy = true;
+        st.cancel = false;
+        drop(st);
+        send_job(Job::Trigger);
+        return false; // the release itself still reaches the app
     }
 
     if st.busy && !replay {
-        if vk == VK_ESCAPE {
+        if vk == vk::ESCAPE {
             if !up {
                 st.cancel = true;
             }
         } else {
-            st.queue.push(queued(k, up));
+            st.queue.push(ev.raw);
         }
         return true;
     }
@@ -259,23 +208,11 @@ fn handle_key(k: &KBDLLHOOKSTRUCT, msg: u32) -> bool {
         return false;
     }
 
-    if st.tap_pending && !replay && !is_modifier(vk) {
-        // A single tap of a swallowed trigger key is still held back; keep
-        // the order by queueing this key behind it for the worker to deliver.
-        st.tap_pending = false;
-        st.tap_gen += 1;
-        st.busy = true;
-        st.queue.push(queued(k, false));
-        drop(st);
-        send_job(Job::FlushTap);
-        return true;
-    }
-
-    track(&mut st, vk);
+    track(&mut st, &ev);
     false
 }
 
-/// Follows a modifier trigger. Returns true on the release that completes a
+/// Follows the trigger. Returns true on the release that completes a
 /// double tap. State is followed even while busy so it never goes stale.
 fn modifier_trigger(st: &mut State, is_trigger: bool, up: bool) -> bool {
     if !is_trigger {
@@ -306,72 +243,20 @@ fn modifier_trigger(st: &mut State, is_trigger: bool, up: bool) -> bool {
     }
 }
 
-/// Handles a swallowed trigger key. Always returns true (swallow).
-fn key_trigger(mut st: MutexGuard<'static, State>, up: bool) -> bool {
-    if up {
-        st.trigger_down = false;
-        return true;
-    }
-    if st.trigger_down || st.busy {
-        st.trigger_down = true; // auto-repeat, or no nested operations
-        return true;
-    }
-    st.trigger_down = true;
-    st.tap_gen += 1;
-    if st.tap_pending && st.within_double_tap() {
-        st.tap_pending = false;
-        st.tap_time = None;
-        st.busy = true;
-        st.cancel = false;
-        drop(st);
-        send_job(Job::Trigger);
-    } else {
-        st.tap_pending = true;
-        st.tap_time = Some(Instant::now());
-        let gen = st.tap_gen;
-        drop(st);
-        thread::spawn(move || {
-            thread::sleep(DOUBLE_TAP);
-            let expired = {
-                let mut st = state();
-                let hit = st.tap_pending && st.tap_gen == gen;
-                if hit {
-                    st.tap_pending = false;
-                }
-                hit
-            };
-            if expired {
-                release_single_tap();
-            }
-        });
-    }
-    true
-}
-
-fn is_modifier(vk: u16) -> bool {
-    matches!(
-        vk,
-        VK_SHIFT | VK_CONTROL | VK_MENU | VK_LSHIFT | VK_RSHIFT | VK_LCONTROL | VK_RCONTROL | VK_LMENU | VK_RMENU | VK_LWIN | VK_RWIN
-    )
-}
-
-fn pressed(vk: u16) -> bool {
-    unsafe { GetAsyncKeyState(vk as i32) < 0 }
-}
-
 /// Mirror what this key does to the IME composition.
-fn track(st: &mut State, vk: u16) {
-    if is_modifier(vk) {
+fn track(st: &mut State, ev: &KeyEvent) {
+    let vk = ev.vk;
+    if vk::is_modifier(vk) {
         return;
     }
-    let fg = unsafe { GetForegroundWindow() } as isize;
+    let fg = keys::foreground_id();
     if fg != st.fg {
         st.fg = fg;
         st.reset_composition();
     }
     st.undo_armed = false;
 
-    if pressed(VK_CONTROL) || pressed(VK_MENU) || pressed(VK_LWIN) || pressed(VK_RWIN) {
+    if ev.chord {
         st.reset_composition();
         return;
     }
@@ -382,15 +267,15 @@ fn track(st: &mut State, vk: u16) {
             if st.converting {
                 st.reset_composition(); // typing on commits the candidates
             }
-            st.comp.push_letter((vk as u8 as char).to_ascii_lowercase(), pressed(VK_SHIFT));
+            st.comp.push_letter((vk as u8 as char).to_ascii_lowercase(), ev.shift);
         }
-        0x30..=0x39 | 0x60..=0x6F | 0xBA..=0xC0 | 0xDB..=0xDF | 0xE2 => {
+        0x30..=0x39 | vk::SYMBOL => {
             if st.converting {
                 st.reset_composition();
             }
             st.comp.push_symbol();
         }
-        VK_BACK => {
+        vk::BACK => {
             if st.converting {
                 st.dirty = true;
             } else {
@@ -400,21 +285,69 @@ fn track(st: &mut State, vk: u16) {
                 }
             }
         }
-        VK_SPACE | VK_CONVERT => st.on_convert_key(),
-        VK_RETURN => st.reset_composition(),
-        VK_ESCAPE => {
+        vk::SPACE => st.on_convert_key(),
+        vk::RETURN => st.reset_composition(),
+        vk::ESCAPE => {
             if st.converting {
                 st.converting = false;
             } else {
                 st.reset_composition();
             }
         }
-        // IME on/off and mode keys: 半角/全角, 英数, ひらがな, IME on/off
-        VK_KANJI | VK_KANA | VK_IME_ON | VK_IME_OFF | 0xF0 | 0xF2 | 0xF3 | 0xF4 => st.reset_composition(),
         _ => {
             if composing {
-                st.dirty = true; // arrows, Tab, F6-F10, 無変換, Delete...
+                st.dirty = true; // arrows, Tab, 英数, かな, Delete...
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Feed presses and releases as (is the trigger, goes down).
+    fn taps(st: &mut State, events: &[(bool, bool)]) -> Vec<bool> {
+        events.iter().map(|&(is_trigger, down)| modifier_trigger(st, is_trigger, !down)).collect()
+    }
+
+    #[test]
+    fn two_clean_taps_fire_on_the_second_release() {
+        let mut st = State::default();
+        assert_eq!(taps(&mut st, &[(true, true), (true, false), (true, true), (true, false)]), [false, false, false, true]);
+        // ... and a third tap starts over instead of firing again.
+        assert_eq!(taps(&mut st, &[(true, true), (true, false)]), [false, false]);
+    }
+
+    #[test]
+    fn shift_used_for_typing_is_not_a_tap() {
+        let mut st = State::default();
+        // Shift+A, then a lone Shift tap: only one clean tap so far.
+        let fired = taps(&mut st, &[(true, true), (false, true), (true, false), (true, true), (true, false)]);
+        assert!(!fired.contains(&true));
+        // A key between the two taps breaks the pair.
+        let mut st = State::default();
+        let fired = taps(&mut st, &[(true, true), (true, false), (false, true), (true, true), (true, false)]);
+        assert!(!fired.contains(&true));
+    }
+
+    #[test]
+    fn slow_taps_and_taps_while_busy_do_not_fire() {
+        let mut st = State::default();
+        taps(&mut st, &[(true, true), (true, false)]);
+        st.tap_time = Some(Instant::now() - DOUBLE_TAP - Duration::from_millis(1));
+        assert_eq!(taps(&mut st, &[(true, true), (true, false)]), [false, false]);
+
+        let mut st = State { busy: true, ..State::default() };
+        let fired = taps(&mut st, &[(true, true), (true, false), (true, true), (true, false)]);
+        assert!(!fired.contains(&true));
+    }
+
+    #[test]
+    fn trigger_settings() {
+        assert_eq!(Trigger::from_setting("rshift").vks, [vk::RSHIFT]);
+        assert_eq!(Trigger::from_setting(" LCtrl ").vks, [vk::LCONTROL]);
+        // An unknown choice (such as "convert" from an older config) means Shift.
+        assert_eq!(Trigger::from_setting("convert").vks, [vk::LSHIFT, vk::RSHIFT]);
     }
 }

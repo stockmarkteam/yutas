@@ -1,26 +1,29 @@
 //! Turns raw kana (or a selection) into finished text.
 //!
 //! Providers:
-//!   anthropic  Claude over the Messages API (raw HTTP: Rust has no official SDK)
-//!   local      any OpenAI-compatible chat endpoint on this machine or network
-//!              (Ollama, LM Studio, llama.cpp): nothing leaves the machine
-//!   mock       for testing the mechanics (YUTAS_PROVIDER=mock)
+//!   gateway  Claude through the company's Claude apps gateway: the Messages
+//!            API shape, sent to the gateway with the bearer it issued at
+//!            sign-in (gateway.rs). Nothing goes to api.anthropic.com.
+//!   local    any OpenAI-compatible chat endpoint on this machine or network
+//!            (Ollama, LM Studio, llama.cpp): nothing leaves the machine
+//!   mock     for testing the mechanics (YUTAS_PROVIDER=mock)
 
 use std::sync::LazyLock;
 use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::secrets;
-use crate::settings::Settings;
+use crate::gateway;
+use crate::settings::{Settings, CLAUDE_MODEL};
 
-const API_URL: &str = "https://api.anthropic.com/v1/messages";
-const API_VERSION: &str = "2026-10-21";
+/// The version Claude Code sends through a gateway.
+const API_VERSION: &str = "2023-06-01";
 
 static CLOUD: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("http client")
 });
@@ -49,16 +52,6 @@ pub fn provider(settings: &Settings) -> String {
         Ok(v) if v.trim() == "mock" => "mock".into(),
         _ => settings.provider.clone(),
     }
-}
-
-fn workspace_id(settings: &Settings) -> Option<String> {
-    if !settings.workspace_id.is_empty() {
-        return Some(settings.workspace_id.clone());
-    }
-    std::env::var("ANTHROPIC_WORKSPACE_ID")
-        .ok()
-        .map(|w| w.trim().to_string())
-        .filter(|w| !w.is_empty())
 }
 
 pub fn system_prompt(settings: &Settings, tone: &str, mode: Mode) -> String {
@@ -126,7 +119,7 @@ pub async fn polish(
     let out = match provider(settings).as_str() {
         "mock" => mock(input, on_text),
         "local" => local(settings, tone, mode, input, on_text, cancelled).await?,
-        _ => anthropic(settings, tone, mode, input, on_text, cancelled).await?,
+        _ => claude(gateway::URL, settings, tone, mode, input, on_text, cancelled).await?,
     };
     let out = match mode {
         Mode::Kana => out.replace(['\r', '\n'], " ").trim().to_string(),
@@ -196,7 +189,26 @@ fn error_detail(body: &str) -> String {
         .unwrap_or_else(|| body.trim().to_string())
 }
 
-// ---- Claude ----
+// ---- Claude, through the gateway ----
+
+/// Explain a failed gateway response to the user.
+fn gateway_error(status: u16, body: &str) -> String {
+    let detail = error_detail(body);
+    let kind = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| v["error"]["type"].as_str().map(str::to_string))
+        .unwrap_or_default();
+    match status {
+        401 => "ゲートウェイへのサインインが必要です（設定画面でサインイン）".to_string(),
+        // The gateway answers 429 both for spend limits and for throttling.
+        429 | 402 if kind == "billing_error" => format!("利用上限に達しました。{detail}"),
+        429 => "混み合っています。少し待ってください".to_string(),
+        403 => "ゲートウェイに拒否されました（接続元が許可されていない可能性）".to_string(),
+        400 | 404 if detail.is_empty() => format!("ゲートウェイで {CLAUDE_MODEL} が使えません"),
+        code if detail.is_empty() || detail.starts_with('<') => format!("ゲートウェイのエラー (HTTP {code})"),
+        code => format!("ゲートウェイのエラー {code}: {detail}"),
+    }
+}
 
 /// Apply one Messages API stream event.
 fn anthropic_event(data: &str, out: &mut String, stop_reason: &mut String) -> Result<bool, String> {
@@ -222,7 +234,9 @@ fn anthropic_event(data: &str, out: &mut String, stop_reason: &mut String) -> Re
     Ok(false)
 }
 
-async fn anthropic(
+/// `base` is the gateway: always gateway::URL outside tests.
+async fn claude(
+    base: &str,
     settings: &Settings,
     tone: &str,
     mode: Mode,
@@ -230,51 +244,50 @@ async fn anthropic(
     on_text: &mut dyn FnMut(&str),
     cancelled: &dyn Fn() -> bool,
 ) -> Result<String, String> {
-    let key = secrets::api_key().ok_or("APIキーが未設定です（設定画面で入力）")?;
+    let mut token = gateway::bearer(base).await?;
 
-    let mut body = json!({
-        "model": settings.model,
+    let body = json!({
+        "model": CLAUDE_MODEL,
         "max_tokens": max_tokens(mode),
         "stream": true,
+        // Speed matters more than deliberation here.
+        "thinking": { "type": "disabled" },
         "system": system_prompt(settings, tone, mode),
         "messages": [{ "role": "user", "content": format!("<input>{input}</input>") }],
     });
-    // Speed matters more than deliberation here. Haiku 5.5 accepts thinking
-    // off; models that always think get the lowest effort instead.
-    if settings.model.starts_with("claude-haiku") {
-        body["thinking"] = json!({ "type": "disabled" });
-    } else {
-        body["output_config"] = json!({ "effort": "low" });
-    }
 
-    let mut request = CLOUD
-        .post(API_URL)
-        .header("x-api-key", key)
-        .header("anthropic-version", API_VERSION);
-    // Keys that are not scoped to a workspace must name one per request.
-    if let Some(workspace) = workspace_id(settings) {
-        request = request.header("anthropic-workspace-id", workspace);
-    }
-    let mut resp = request.json(&body).send().await.map_err(|e| {
-        if e.is_timeout() {
-            "タイムアウトしました".to_string()
-        } else if e.is_connect() {
-            "接続できません（オフライン？）".to_string()
-        } else {
-            format!("通信エラー: {e}")
+    let url = format!("{base}/v1/messages");
+    let mut retried = false;
+    let mut resp = loop {
+        let resp = CLOUD
+            .post(&url)
+            .bearer_auth(&token)
+            .header("anthropic-version", API_VERSION)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    "タイムアウトしました".to_string()
+                } else if e.is_connect() {
+                    "ゲートウェイに接続できません（オフライン？）".to_string()
+                } else {
+                    format!("通信エラー: {e}")
+                }
+            })?;
+        // The bearer may have been revoked or our clock may be off: get a
+        // new one and try once more.
+        if resp.status().as_u16() == 401 && !retried {
+            retried = true;
+            token = gateway::bearer_after_rejection(base, &token).await?;
+            continue;
         }
-    })?;
+        break resp;
+    };
 
     let status = resp.status();
     if !status.is_success() {
-        let detail = error_detail(&resp.text().await.unwrap_or_default());
-        return Err(match status.as_u16() {
-            401 => "APIキーが無効です".to_string(),
-            429 => "レート制限中です。少し待ってください".to_string(),
-            400 if detail.contains("anthropic-workspace-id") => "ワークスペースIDが必要です（設定画面で入力）".to_string(),
-            404 => format!("モデルが見つかりません: {}", settings.model),
-            code => format!("APIエラー {code}: {detail}"),
-        });
+        return Err(gateway_error(status.as_u16(), &resp.text().await.unwrap_or_default()));
     }
 
     let mut out = String::new();
@@ -447,6 +460,94 @@ mod tests {
         assert_eq!((out.as_str(), stop.as_str()), ("明日", "end_turn"));
         let err = r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
         assert!(anthropic_event(err, &mut out, &mut stop).is_err());
+    }
+
+    #[test]
+    fn gateway_errors_are_explained() {
+        let limit = r#"{"type":"error","error":{"type":"billing_error","message":"Monthly limit reached. Resets 2026-12-01."}}"#;
+        assert!(gateway_error(429, limit).starts_with("利用上限に達しました。Monthly limit"));
+        let busy = r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#;
+        assert_eq!(gateway_error(429, busy), "混み合っています。少し待ってください");
+        assert!(gateway_error(401, r#"{"error":"invalid token"}"#).contains("サインイン"));
+        // a load balancer's HTML error page is not shown to the user
+        assert_eq!(gateway_error(502, "<html><body>Bad Gateway</body></html>"), "ゲートウェイのエラー (HTTP 502)");
+        assert_eq!(gateway_error(502, ""), "ゲートウェイのエラー (HTTP 502)");
+    }
+
+    const SSE: &str = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"明日の会議\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n";
+
+    /// A clean-up against the gateway at `url`.
+    fn run(url: &str) -> Result<String, String> {
+        let settings = Settings::default();
+        tauri::async_runtime::block_on(claude(url, &settings, "x", Mode::Kana, "あしたのかいぎ", &mut |_| {}, &|| false))
+    }
+
+    #[test]
+    fn the_gateway_and_the_model_are_fixed() {
+        assert_eq!(gateway::URL, "https://ax.stockmark.co.jp");
+        assert_eq!(CLAUDE_MODEL, "claude-haiku-5-5");
+    }
+
+    #[test]
+    fn claude_goes_through_the_gateway_with_the_bearer() {
+        use crate::gateway::testserver::{serve, session_lock, sign_in};
+        let _lock = session_lock();
+        let server = serve(|_, _| (200, "text/event-stream", SSE.to_string()));
+        sign_in(&server.url, "at-1", "rt-1", 3600);
+        assert_eq!(run(&server.url).unwrap(), "明日の会議");
+
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!((request.method.as_str(), request.path.as_str()), ("POST", "/v1/messages"));
+        assert_eq!(request.header("authorization").as_deref(), Some("Bearer at-1"));
+        assert_eq!(request.header("x-api-key"), None, "no Claude API key is ever sent");
+        let body: Value = serde_json::from_str(&request.body).unwrap();
+        assert_eq!(body["model"], "claude-haiku-5-5");
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(body.get("output_config").is_none());
+        assert_eq!(body["messages"][0]["content"], "<input>あしたのかいぎ</input>");
+    }
+
+    #[test]
+    fn rejected_bearer_is_refreshed_once() {
+        use crate::gateway::testserver::{serve, session_lock, sign_in};
+        let _lock = session_lock();
+        let server = serve(|req, _| match (req.path.as_str(), req.header("authorization").as_deref()) {
+            ("/oauth/token", _) => (200, "application/json", r#"{"access_token":"at-2","refresh_token":"rt-2","expires_in":3600}"#.into()),
+            ("/v1/messages", Some("Bearer at-2")) => (200, "text/event-stream", SSE.to_string()),
+            _ => (401, "application/json", r#"{"error":"invalid token"}"#.into()),
+        });
+        // Not expired by our clock, yet the gateway no longer accepts it.
+        sign_in(&server.url, "at-1", "rt-1", 3600);
+        assert_eq!(run(&server.url).unwrap(), "明日の会議");
+        let paths: Vec<String> = server.requests.lock().unwrap().iter().map(|r| r.path.clone()).collect();
+        assert_eq!(paths, ["/v1/messages", "/oauth/token", "/v1/messages"]);
+    }
+
+    #[test]
+    fn gateway_failures_reach_the_user() {
+        use crate::gateway::testserver::{serve, session_lock, sign_in};
+        let _lock = session_lock();
+        // Rejected even after a refresh: say so, and do not loop.
+        let rejecting = serve(|req, _| match req.path.as_str() {
+            "/oauth/token" => (200, "application/json", r#"{"access_token":"at-2","expires_in":3600}"#.into()),
+            _ => (401, "application/json", r#"{"error":"invalid token"}"#.into()),
+        });
+        sign_in(&rejecting.url, "at-1", "rt-1", 3600);
+        assert!(run(&rejecting.url).unwrap_err().contains("サインインが必要"));
+        assert_eq!(rejecting.requests.lock().unwrap().len(), 3);
+
+        let capped = serve(|_, _| {
+            (429, "application/json", r#"{"type":"error","error":{"type":"billing_error","message":"Monthly limit reached."}}"#.into())
+        });
+        sign_in(&capped.url, "at-1", "rt-1", 3600);
+        assert_eq!(run(&capped.url).unwrap_err(), "利用上限に達しました。Monthly limit reached.");
+
+        // Not signed in, and no gateway configured at all.
+        crate::gateway::sign_out().unwrap();
+        assert!(run(&capped.url).unwrap_err().contains("サインインが必要"));
+        assert_eq!(capped.requests.lock().unwrap().len(), 1, "nothing is sent without a session");
     }
 
     #[test]
